@@ -11,6 +11,7 @@ from torch import multiprocessing as mp
 
 from .env_utils import Environment
 from douzero.env import Env
+from douzero.env.env import _cards2array
 
 Card2Column = {3: 0, 4: 1, 5: 2, 6: 3, 7: 4, 8: 5, 9: 6, 10: 7,
                11: 8, 12: 9, 13: 10, 14: 11, 17: 12}
@@ -31,6 +32,8 @@ log.propagate = False
 log.addHandler(shandle)
 log.setLevel(logging.INFO)
 
+# Buffers are used to transfer data between actor processes
+# and learner processes. They are shared tensors in GPU
 Buffers = typing.Dict[str, typing.List[torch.Tensor]]
 
 def create_env(flags):
@@ -41,6 +44,11 @@ def get_batch(free_queue,
               buffers,
               flags,
               lock):
+    """
+    This function will sample a batch from the buffers based
+    on the indices received from the full queue. It will also
+    free the indices by sending it to full_queue.
+    """
     with lock:
         indices = [full_queue.get() for _ in range(flags.batch_size)]
     batch = {
@@ -52,6 +60,9 @@ def get_batch(free_queue,
     return batch
 
 def create_optimizers(flags, learner_model):
+    """
+    Create three optimizers for the three positions
+    """
     positions = ['landlord', 'landlord_up', 'landlord_down']
     optimizers = {}
     for position in positions:
@@ -64,12 +75,17 @@ def create_optimizers(flags, learner_model):
         optimizers[position] = optimizer
     return optimizers
 
-def create_buffers(flags):
+def create_buffers(flags, device_iterator):
+    """
+    We create buffers for different positions as well as
+    for different devices (i.e., GPU). That is, each device
+    will have three buffers for the three positions.
+    """
     T = flags.unroll_length
     positions = ['landlord', 'landlord_up', 'landlord_down']
-    buffers = []
-    for device in range(torch.cuda.device_count()):
-        buffers.append({})
+    buffers = {}
+    for device in device_iterator:
+        buffers[device] = {}
         for position in positions:
             x_dim = 319 if position == 'landlord' else 430
             specs = dict(
@@ -83,19 +99,26 @@ def create_buffers(flags):
             _buffers: Buffers = {key: [] for key in specs}
             for _ in range(flags.num_buffers):
                 for key in _buffers:
-                    _buffer = torch.empty(**specs[key]).to(torch.device('cuda:'+str(device))).share_memory_()
+                    if not device == "cpu":
+                        _buffer = torch.empty(**specs[key]).to(torch.device('cuda:'+str(device))).share_memory_()
+                    else:
+                        _buffer = torch.empty(**specs[key]).to(torch.device('cpu')).share_memory_()
                     _buffers[key].append(_buffer)
             buffers[device][position] = _buffers
     return buffers
 
 def act(i, device, free_queue, full_queue, model, buffers, flags):
+    """
+    This function will run forever until we stop it. It will generate
+    data from the environment and send the data to buffer. It uses
+    a free queue and full queue to syncup with the main process.
+    """
     positions = ['landlord', 'landlord_up', 'landlord_down']
     try:
         T = flags.unroll_length
-        log.info('Device %i Actor %i started.', device, i)
+        log.info('Device %s Actor %i started.', str(device), i)
 
         env = create_env(flags)
-        
         env = Environment(env, device)
 
         done_buf = {p: [] for p in positions}
@@ -117,8 +140,8 @@ def act(i, device, free_queue, full_queue, model, buffers, flags):
                 _action_idx = int(agent_output['action'].cpu().detach().numpy())
                 action = obs['legal_actions'][_action_idx]
                 obs_action_buf[position].append(_cards2tensor(action))
-                position, obs, env_output = env.step(action)
                 size[position] += 1
+                position, obs, env_output = env.step(action)
                 if env_output['done']:
                     for p in positions:
                         diff = size[p] - len(target_buf[p])
@@ -133,7 +156,7 @@ def act(i, device, free_queue, full_queue, model, buffers, flags):
                     break
 
             for p in positions:
-                if size[p] > T: 
+                while size[p] > T: 
                     index = free_queue[p].get()
                     if index is None:
                         break
@@ -162,19 +185,11 @@ def act(i, device, free_queue, full_queue, model, buffers, flags):
         raise e
 
 def _cards2tensor(list_cards):
-    if len(list_cards) == 0:
-        return torch.zeros(54, dtype=torch.int8)
-
-    matrix = np.zeros([4, 13], dtype=np.int8)
-    jokers = np.zeros(2, dtype=np.int8)
-    counter = Counter(list_cards)
-    for card, num_times in counter.items():
-        if card < 20:
-            matrix[:, Card2Column[card]] = NumOnes2Array[num_times]
-        elif card == 20:
-            jokers[0] = 1
-        elif card == 30:
-            jokers[1] = 1
-    matrix = np.concatenate((matrix.flatten('F'), jokers))
+    """
+    Convert a list of integers to the tensor
+    representation
+    See Figure 2 in https://arxiv.org/pdf/2106.06135.pdf
+    """
+    matrix = _cards2array(list_cards)
     matrix = torch.from_numpy(matrix)
     return matrix
